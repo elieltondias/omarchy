@@ -1,0 +1,113 @@
+#!/bin/bash
+
+# omarchy:summary=Set the default file manager used by xdg, the desktop keys and Show in folder
+# omarchy:args=[nautilus|nemo|dolphin|flea|thunar]
+# omarchy:examples=omarchy default file-manager | omarchy default file-manager thunar
+
+installing=false
+if [[ ${1:-} == "--install" ]]; then
+  installing=true
+  shift
+fi
+
+if (($# == 0)); then
+  handler=$(xdg-mime query default inode/directory 2>/dev/null || true)
+  case "$handler" in
+  org.gnome.Nautilus.desktop) echo "nautilus" ;;
+  nemo.desktop) echo "nemo" ;;
+  org.kde.dolphin.desktop) echo "dolphin" ;;
+  com.thisisgm.flea.desktop) echo "flea" ;;
+  thunar.desktop) echo "thunar" ;;
+  "")
+    # Nothing valid answers inode/directory anywhere: Omarchy's default does.
+    echo "nautilus"
+    ;;
+  *) echo "$handler" ;;
+  esac
+  exit 0
+fi
+
+case "$1" in
+nautilus) package="nautilus"; command="nautilus"; desktop_id="org.gnome.Nautilus.desktop"; name="Nautilus"; glyph="" ;;
+nemo) package="nemo"; command="nemo"; desktop_id="nemo.desktop"; name="Nemo"; glyph="" ;;
+dolphin) package="dolphin"; command="dolphin"; desktop_id="org.kde.dolphin.desktop"; name="Dolphin"; glyph="" ;;
+flea) package="flea"; command="flea"; desktop_id="com.thisisgm.flea.desktop"; name="Flea"; glyph="" ;;
+thunar) package="thunar"; command="thunar"; desktop_id="thunar.desktop"; name="Thunar"; glyph="" ;;
+*)
+  echo "Usage: omarchy-default-file-manager <nautilus|nemo|dolphin|flea|thunar>"
+  exit 1
+  ;;
+esac
+
+if omarchy-cmd-missing "$command"; then
+  if [[ $installing == "false" ]]; then
+    exec omarchy-launch-floating-terminal-with-presentation omarchy-default-file-manager --install "$1"
+  else
+    omarchy-pkg-add "$package" || exit 1
+  fi
+fi
+
+# `flea --default` binds the file-manager keys by appending a marked block to
+# the user's bindings, which would keep answering them after another file
+# manager is chosen here. Only that block goes: both markers have to be there
+# for it to be the block Flea wrote, and `flea --picker`'s own block and
+# anything else the file holds are left alone.
+user_bindings="$HOME/.config/hypr/bindings.lua"
+if [[ -f $user_bindings ]] &&
+  grep -q -- '-- flea --default: begin' "$user_bindings" &&
+  grep -q -- '-- flea --default: end' "$user_bindings"; then
+  sed -i '/-- flea --default: begin/,/-- flea --default: end/d' "$user_bindings"
+  hyprctl reload >/dev/null 2>&1 || true
+fi
+
+# The handler is read back rather than trusted: xdg-mime default exits 0 no
+# matter what it wrote.
+xdg-mime default "$desktop_id" inode/directory || exit 1
+handler=$(xdg-mime query default inode/directory 2>/dev/null || true)
+if [[ $handler != "$desktop_id" ]]; then
+  echo "Could not set $name as the default file manager (handler: ${handler:-none})" >&2
+  exit 1
+fi
+
+# "Show in folder" calls org.freedesktop.FileManager1 on the session bus, and
+# every file manager registers for that name in /usr/share/dbus-1/services,
+# where D-Bus keeps whichever registration it reads first. Copy the chosen
+# one's registration into the user's directory, which is read before every
+# system one, so this choice decides instead of readdir order.
+file_manager1_service() {
+  local data_dirs dir service service_exec source=""
+  local user_dir="${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services"
+  local user_service="$user_dir/org.freedesktop.FileManager1.service"
+
+  IFS=: read -ra data_dirs <<<"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+  for dir in "${data_dirs[@]}"; do
+    for service in "$dir"/dbus-1/services/*.service; do
+      [[ -f $service ]] || continue
+      grep -qx "Name=org.freedesktop.FileManager1" "$service" || continue
+      service_exec=$(sed -n 's/^Exec=//p' "$service" | head -1)
+      [[ ${service_exec,,} == *"${command,,}"* ]] || continue
+      source=$service
+      break 2
+    done
+  done
+
+  # A file the user wrote for another name is not ours to repoint: the bus
+  # reads whatever the file holds, whatever the file is called.
+  if [[ -f $user_service ]] && ! grep -qx "Name=org.freedesktop.FileManager1" "$user_service"; then
+    return 0
+  fi
+
+  if [[ -n $source ]]; then
+    mkdir -p "$user_dir"
+    {
+      printf '# Written by omarchy-default-file-manager so the chosen file manager answers Show in folder.\n'
+      cat "$source"
+    } >"$user_service"
+  elif [[ -f $user_service ]] && grep -q "omarchy-default-file-manager" "$user_service"; then
+    # The chosen file manager registers nothing of its own to put in front.
+    rm -f "$user_service"
+  fi
+}
+file_manager1_service || exit 1
+
+omarchy-notification-send -g $glyph "$(omarchy-i18n default.fileManagerSet "$name")"
